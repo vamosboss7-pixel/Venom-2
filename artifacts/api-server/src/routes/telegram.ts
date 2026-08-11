@@ -345,34 +345,36 @@ async function saveTelegramContact(message: NonNullable<TelegramUpdate["message"
     return;
   }
 
-  await db
+  const registration = {
+    telegramId: user.id,
+    chatId: message.chat.id,
+    firstName: contact.first_name || user.first_name,
+    lastName: contact.last_name ?? user.last_name ?? null,
+    username: user.username ?? null,
+    phoneNumber: contact.phone_number,
+    languageCode: user.language_code ?? null,
+    updatedAt: new Date(),
+  };
+  const inserted = await db
     .insert(telegramUsers)
-    .values({
-      telegramId: user.id,
-      chatId: message.chat.id,
-      firstName: contact.first_name || user.first_name,
-      lastName: contact.last_name ?? user.last_name ?? null,
-      username: user.username ?? null,
-      phoneNumber: contact.phone_number,
-      languageCode: user.language_code ?? null,
-      updatedAt: new Date(),
-    })
-    .onConflictDoUpdate({
-      target: telegramUsers.telegramId,
-      set: {
-        chatId: message.chat.id,
-        firstName: contact.first_name || user.first_name,
-        lastName: contact.last_name ?? user.last_name ?? null,
-        username: user.username ?? null,
-        phoneNumber: contact.phone_number,
-        languageCode: user.language_code ?? null,
-        updatedAt: new Date(),
-      },
-    });
+    .values(registration)
+    .onConflictDoNothing({ target: telegramUsers.telegramId })
+    .returning({ telegramId: telegramUsers.telegramId });
+
+  if (inserted.length === 0) {
+    await db
+      .update(telegramUsers)
+      .set(registration)
+      .where(eq(telegramUsers.telegramId, user.id));
+  }
+
+  const text = inserted.length > 0
+    ? `✅ እንኳን ደስ አለዎት ${registration.firstName}! ምዝገባዎ ተሳክቷል።\n\n🤑 የ10 ብር የPlay Wallet ገቢ ተደርጎልዎታል።\n\nአሁን Flash Bingoን መጫወት ይችላሉ።`
+    : "እርስዎ ቀድሞውኑ የFlash Bingo ተጠቃሚ ነዎት።\n\nበቀጥታ ወደ ጨዋታ መቀላቀል ይችላሉ።";
 
   await telegramRequest("sendMessage", {
     chat_id: message.chat.id,
-    text: `✅ እንኳን ደስ አለዎት ${user.first_name}! ምዝገባዎ ተሳክቷል።\n\nአሁን Flash Bingoን መጫወት ይችላሉ።`,
+    text,
     reply_markup: getMainKeyboard(),
   });
 }
