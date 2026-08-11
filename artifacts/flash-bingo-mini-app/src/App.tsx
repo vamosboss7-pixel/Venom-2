@@ -51,6 +51,12 @@ const CALL_INTERVAL = 3000;
 
 type Cell = number | 'star';
 type Tab = 'bingo' | 'wallet';
+type Profile = {
+  firstName?: string;
+  lastName?: string | null;
+  playWalletBalance?: string;
+  winWalletBalance?: string;
+};
 
 function buildCard(id: number): Cell[] {
   let seed = id * 9301 + 49297;
@@ -91,7 +97,8 @@ function makeSequence() {
 }
 
 function useTelegramBridge() {
-  const [userName, setUserName] = useState('Demo player');
+  const [userName, setUserName] = useState('');
+  const [profile, setProfile] = useState<Profile | null>(null);
   const [isTelegram, setIsTelegram] = useState(false);
   useEffect(() => {
     const webApp = window.Telegram?.WebApp;
@@ -119,11 +126,15 @@ function useTelegramBridge() {
       body: JSON.stringify({ initData: webApp.initData }),
     }).then(async (response) => {
       if (!response.ok) return;
-      const data = await response.json() as { user?: { first_name?: string; last_name?: string } };
+      const data = await response.json() as { user?: { first_name?: string; last_name?: string }; profile?: Profile };
       if (data.user?.first_name) setUserName([data.user.first_name, data.user.last_name].filter(Boolean).join(' '));
+      if (data.profile) {
+        setProfile(data.profile);
+        if (data.profile.firstName) setUserName([data.profile.firstName, data.profile.lastName].filter(Boolean).join(' '));
+      }
     }).catch(() => undefined);
   }, []);
-  return { userName, isTelegram };
+  return { userName, profile, isTelegram };
 }
 
 function Header() {
@@ -154,7 +165,7 @@ function Header() {
           <button type="button" data-testid="button-header-help" onClick={() => setMenuOpen(false)} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left text-sm hover:bg-white/10">
             <CircleHelp className="h-4 w-4 text-[hsl(var(--primary))]" /> እገዛ እና ህጎች
           </button>
-          <div className="px-3 pb-2 pt-1 text-[10px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]">{isTelegram ? userName : 'Browser demo'}</div>
+          <div className="px-3 pb-2 pt-1 text-[10px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]">{isTelegram ? userName : 'Telegram only'}</div>
         </div>
       )}
     </header>
@@ -263,6 +274,10 @@ function NumberGrid({ selected, taken, onToggle }: { selected: Set<number>; take
 }
 
 function WalletPanel() {
+  const { profile } = useTelegramBridge();
+  const playWallet = profile?.playWalletBalance ?? '—';
+  const winWallet = profile?.winWalletBalance ?? '—';
+
   return (
     <div className="flex-1 overflow-y-auto px-3 pb-5 pt-5">
       <section className="depth-surface relative rounded-[32px] bg-[hsl(161_35%_15%)] p-6 shadow-[0_12px_35px_hsl(161_42%_4%/.24)]">
@@ -270,11 +285,11 @@ function WalletPanel() {
         <div className="mt-5 grid grid-cols-2 gap-5">
           <div className="depth-card rounded-[26px] border border-[hsl(var(--foreground)/.8)] px-4 py-4">
             <div className="text-lg font-extrabold leading-tight">🎮 PLAY<br />WALLET</div>
-            <div data-testid="text-play-wallet-balance" className="mt-3 font-mono text-2xl font-bold">44.00</div>
+            <div data-testid="text-play-wallet-balance" className="mt-3 font-mono text-2xl font-bold">{playWallet}</div>
           </div>
           <div className="depth-card rounded-[26px] border border-[hsl(var(--foreground)/.8)] px-4 py-4">
             <div className="text-lg font-extrabold leading-tight">🏆 WIN<br />WALLET</div>
-            <div data-testid="text-win-wallet-balance" className="mt-3 font-mono text-2xl font-bold">0.00</div>
+            <div data-testid="text-win-wallet-balance" className="mt-3 font-mono text-2xl font-bold">{winWallet}</div>
           </div>
         </div>
       </section>

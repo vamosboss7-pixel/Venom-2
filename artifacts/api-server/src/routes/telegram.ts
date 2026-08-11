@@ -532,7 +532,7 @@ router.post("/telegram/webhook", async (req, res) => {
   }
 });
 
-router.post("/telegram/auth", (req, res) => {
+router.post("/telegram/auth", async (req, res) => {
   const botToken = getBotToken();
   const { initData } = req.body as TelegramAuthPayload;
   if (!botToken || typeof initData !== "string" || !isValidTelegramInitData(initData, botToken)) {
@@ -545,7 +545,16 @@ router.post("/telegram/auth", (req, res) => {
     res.status(401).json({ error: "Telegram user data is missing" });
     return;
   }
-  res.json({ user });
+  const profile = await db.query.telegramUsers.findFirst({
+    where: eq(telegramUsers.telegramId, user.id),
+    columns: {
+      firstName: true,
+      lastName: true,
+      playWalletBalance: true,
+      winWalletBalance: true,
+    },
+  });
+  res.json({ user, profile });
 });
 
 export async function registerTelegramWebhook() {
