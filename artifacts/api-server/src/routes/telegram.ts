@@ -109,7 +109,7 @@ function isTelegramWebhookRequest(req: Request) {
   return Boolean(expectedSecret) && req.header("x-telegram-bot-api-secret-token") === expectedSecret;
 }
 
-function isValidTelegramInitData(initData: string, botToken: string) {
+export function isValidTelegramInitData(initData: string, botToken: string) {
   const params = new URLSearchParams(initData);
   const receivedHash = params.get("hash");
   const authDate = Number(params.get("auth_date"));
@@ -128,7 +128,7 @@ function isValidTelegramInitData(initData: string, botToken: string) {
   return receivedHashBuffer.length === calculatedHashBuffer.length && timingSafeEqual(receivedHashBuffer, calculatedHashBuffer);
 }
 
-function parseTelegramUser(initData: string) {
+export function parseTelegramUser(initData: string) {
   const userValue = new URLSearchParams(initData).get("user");
   if (!userValue) return undefined;
   try {

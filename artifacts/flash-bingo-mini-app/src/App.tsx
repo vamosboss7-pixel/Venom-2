@@ -81,21 +81,6 @@ function buildCard(id: number): Cell[] {
   });
 }
 
-function makeSequence() {
-  const sequence = Array.from({ length: 75 }, (_, index) => index + 1);
-  let seed = 12345;
-  const random = () => {
-    seed = (seed * 9301 + 49297) % 233280;
-    return seed / 233280;
-  };
-  for (let index = sequence.length - 1; index > 0; index -= 1) {
-    const swap = Math.floor(random() * (index + 1));
-    [sequence[index], sequence[swap]] = [sequence[swap], sequence[index]];
-  }
-  const openingCalls = [61, 17, 11, 53];
-  return [...openingCalls, ...sequence.filter((number) => !openingCalls.includes(number))];
-}
-
 function useTelegramBridge() {
   const [userName, setUserName] = useState('');
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -304,6 +289,19 @@ function WalletPanel() {
   );
 }
 
+function getApiUrl() {
+  const configured = import.meta.env.VITE_API_BASE_URL;
+  return configured ? (configured.startsWith('http') ? configured : `https://${configured}`) : '';
+}
+
+function telegramHeaders(): Record<string, string> {
+  const initData = window.Telegram?.WebApp?.initData;
+  return initData ? { 'x-telegram-init-data': initData } : {};
+}
+
+type RoundData = { id: number; calls: Array<{ number: number; position: number; calledAt: string }>; takenCardNumbers: number[] };
+type ServerCard = { id?: number; cardNumber: number; grid: Cell[] };
+
 function Home() {
   const [, setLocation] = useLocation();
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -311,14 +309,20 @@ function Home() {
   const [countdown, setCountdown] = useState(START_COUNTDOWN);
   const [tab, setTab] = useState<Tab>('bingo');
   const [showWarning, setShowWarning] = useState(false);
-  const taken = useMemo(() => new Set([66, 68, 70, 73, 80, 83, 85, 87, 89, 91, 93, 95, 98, 101, 104, 107, 110, 112, 115, 119, 121, 124, 126, 131, 133, 137, 139]), []);
+  const [round, setRound] = useState<RoundData | null>(null);
+  const taken = useMemo(() => new Set(round?.takenCardNumbers ?? []), [round]);
+  useEffect(() => { void fetch(`${getApiUrl()}/api/bingo/round`).then((response) => response.ok ? response.json() as Promise<RoundData> : null).then((data) => { if (data) setRound(data); }).catch(() => undefined); }, []);
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   useEffect(() => {
     const timer = window.setInterval(() => setCountdown((current) => {
       if (current <= 1) {
         if (selectedRef.current.size > 0) {
-          setLocation(`/play?cards=${[...selectedRef.current].sort((a, b) => a - b).join(',')}`);
+          const cardNumbers = [...selectedRef.current].sort((a, b) => a - b);
+          void fetch(`${getApiUrl()}/api/bingo/cards`, { method: 'POST', headers: { 'content-type': 'application/json', ...telegramHeaders() }, body: JSON.stringify({ cardNumbers }) })
+            .then((response) => response.ok ? response.json() as Promise<{ roundId: number }> : null)
+            .then((data) => { if (data) setLocation(`/play?round=${data.roundId}`); })
+            .catch(() => undefined);
           return 0;
         }
         return START_COUNTDOWN;
@@ -418,34 +422,30 @@ function Play() {
   const [location, setLocation] = useLocation();
   const [muted, setMuted] = useState(true);
   const [tab, setTab] = useState<Tab>('bingo');
-  const sequence = useMemo(makeSequence, []);
-  const [drawn, setDrawn] = useState(1);
-  const roundId = new URLSearchParams(location.split('?')[1] ?? '').get('round') ?? GAME_ID;
-  const winnerEffect = [...roundId].reduce((total, character) => total + character.charCodeAt(0), 0) % 4;
-  const cards = useMemo(() => {
-    const query = new URLSearchParams(location.split('?')[1] ?? '');
-    const ids = (query.get('cards') ?? '258,233,216,229').split(',').map(Number).filter(Number.isFinite).slice(0, 4);
-    return ids.map((id) => ({ id, grid: buildCard(id) }));
-  }, [location]);
-  const called = useMemo(() => new Set(sequence.slice(0, drawn)), [drawn, sequence]);
-  const current = sequence[Math.max(0, drawn - 1)] ?? null;
-  const winnerMatch = useMemo(() => {
-    const match = cards
-      .map((card) => ({ card, pattern: findWinnerPattern(card.grid, called) }))
-      .find(({ pattern }) => pattern);
-    return match ?? null;
-  }, [called, cards]);
+  const [round, setRound] = useState<RoundData | null>(null);
+  const [cards, setCards] = useState<Array<{ id: number; grid: Cell[] }>>([]);
+  const query = new URLSearchParams(location.split('?')[1] ?? '');
+  const roundId = query.get('round');
+  const called = useMemo(() => new Set((round?.calls ?? []).map((call) => call.number)), [round]);
+  const current = round?.calls.at(-1)?.number ?? null;
+  const winnerEffect = String(round?.id ?? roundId ?? '').split('').reduce((total, character) => total + character.charCodeAt(0), 0) % 4;
   useEffect(() => {
-    if (winnerMatch || drawn >= sequence.length) return;
-    const timer = window.setTimeout(() => setDrawn((value) => Math.min(sequence.length, value + 1)), CALL_INTERVAL);
-    return () => window.clearTimeout(timer);
-  }, [drawn, sequence.length, winnerMatch]);
-  useEffect(() => {
-    if (!winnerMatch) return;
-    const timer = window.setTimeout(() => setLocation('/'), 6000);
-    return () => window.clearTimeout(timer);
-  }, [setLocation, winnerMatch]);
-  return <AppShell tab={tab} setTab={setTab}>{tab === 'wallet' ? <WalletPanel /> : <div className="min-h-0 flex-1 overflow-y-auto bg-[linear-gradient(180deg,hsl(161_42%_9%),hsl(161_48%_7%))] p-3"><div className="space-y-3"><CalledBoard called={called} latest={current} /><CalledPanel current={current} muted={muted} onToggle={() => setMuted((value) => !value)} callIndex={drawn} called={called} /><div className="grid grid-cols-2 gap-2.5">{cards.map((card) => { const pattern = winnerMatch?.card.id === card.id ? winnerMatch.pattern : null; return <PlayCard key={card.id} {...card} called={called} winner={pattern} />; })}</div><div className="flex items-center justify-center gap-2 pb-2 text-[11px] text-[hsl(var(--muted-foreground))]"><Sparkles className="h-3.5 w-3.5 text-[hsl(var(--primary))]" /> ቁጥሮች በየ 3 ሰከንዱ ይጠራሉ</div></div></div>}{winnerMatch && <WinnerModal card={winnerMatch.card} called={called} pattern={winnerMatch.pattern!} winnerEffect={winnerEffect} prize={2280} />}</AppShell>;
+    let cancelled = false;
+    const load = async () => {
+      const roundResponse = await fetch(`${getApiUrl()}/api/bingo/round`);
+      if (!roundResponse.ok) return;
+      const nextRound = await roundResponse.json() as RoundData;
+      const cardResponse = await fetch(`${getApiUrl()}/api/bingo/cards`, { headers: telegramHeaders() });
+      const cardData = cardResponse.ok ? await cardResponse.json() as { cards: ServerCard[] } : { cards: [] };
+      if (!cancelled) { setRound(nextRound); setCards(cardData.cards.map((card) => ({ id: card.cardNumber, grid: card.grid }))); }
+    };
+    void load().catch(() => undefined);
+    const timer = window.setInterval(() => { void load().catch(() => undefined); }, CALL_INTERVAL);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [roundId]);
+  const winnerMatch = useMemo(() => cards.map((card) => ({ card, pattern: findWinnerPattern(card.grid, called) })).find(({ pattern }) => pattern) ?? null, [called, cards]);
+  useEffect(() => { if (!winnerMatch) return; const timer = window.setTimeout(() => setLocation('/'), 6000); return () => window.clearTimeout(timer); }, [setLocation, winnerMatch]);
+  return <AppShell tab={tab} setTab={setTab}>{tab === 'wallet' ? <WalletPanel /> : <div className="min-h-0 flex-1 overflow-y-auto bg-[linear-gradient(180deg,hsl(161_42%_9%),hsl(161_48%_7%))] p-3"><div className="space-y-3"><CalledBoard called={called} latest={current} /><CalledPanel current={current} muted={muted} onToggle={() => setMuted((value) => !value)} callIndex={round?.calls.length ?? 0} called={called} /><div className="grid grid-cols-2 gap-2.5">{cards.map((card) => { const pattern = winnerMatch?.card.id === card.id ? winnerMatch.pattern : null; return <PlayCard key={card.id} {...card} called={called} winner={pattern} />; })}</div><div className="flex items-center justify-center gap-2 pb-2 text-[11px] text-[hsl(var(--muted-foreground))]"><Sparkles className="h-3.5 w-3.5 text-[hsl(var(--primary))]" /> ቁጥሮች በየ 3 ሰከንዱ ይጠራሉ</div></div></div>}{winnerMatch && <WinnerModal card={winnerMatch.card} called={called} pattern={winnerMatch.pattern!} winnerEffect={winnerEffect} prize={2280} />}</AppShell>;
 }
 
 function AppShell({ children, tab, setTab }: { children: ReactNode; tab: Tab; setTab: (tab: Tab) => void }) {
