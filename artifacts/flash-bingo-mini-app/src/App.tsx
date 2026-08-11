@@ -303,6 +303,7 @@ type RoundData = {
   id: number;
   calls: Array<{ number: number; position: number; calledAt: string }>;
   takenCardNumbers: number[];
+  pot: string;
   winner?: { name?: string; cardNumber: number; payout: string; status: string };
 };
 type ServerCard = { id?: number; cardNumber: number; grid: Cell[] };
@@ -314,6 +315,7 @@ function Home() {
   const [countdown, setCountdown] = useState(START_COUNTDOWN);
   const [tab, setTab] = useState<Tab>('bingo');
   const [showWarning, setShowWarning] = useState(false);
+  const [warningMessage, setWarningMessage] = useState('');
   const [round, setRound] = useState<RoundData | null>(null);
   const taken = useMemo(() => new Set(round?.takenCardNumbers ?? []), [round]);
   useEffect(() => { void fetch(`${getApiUrl()}/api/bingo/round`).then((response) => response.ok ? response.json() as Promise<RoundData> : null).then((data) => { if (data) setRound(data); }).catch(() => undefined); }, []);
@@ -325,9 +327,16 @@ function Home() {
         if (selectedRef.current.size > 0) {
           const cardNumbers = [...selectedRef.current].sort((a, b) => a - b);
           void fetch(`${getApiUrl()}/api/bingo/cards`, { method: 'POST', headers: { 'content-type': 'application/json', ...telegramHeaders() }, body: JSON.stringify({ cardNumbers }) })
-            .then((response) => response.ok ? response.json() as Promise<{ roundId: number }> : null)
+            .then(async (response) => {
+              if (response.ok) return response.json() as Promise<{ roundId: number }>;
+              const body = await response.json().catch(() => ({})) as { error?: string };
+              setWarningMessage(response.status === 402 ? 'Insufficient play wallet balance' : response.status === 409 ? (body.error ?? 'A selected card was just taken') : (body.error ?? 'Card purchase failed'));
+              setShowWarning(true);
+              window.setTimeout(() => setShowWarning(false), 3000);
+              return null;
+            })
             .then((data) => { if (data) setLocation(`/play?round=${data.roundId}`); })
-            .catch(() => undefined);
+            .catch(() => { setWarningMessage('Card purchase failed. Please try again.'); setShowWarning(true); window.setTimeout(() => setShowWarning(false), 3000); });
           return 0;
         }
         return START_COUNTDOWN;
@@ -352,11 +361,11 @@ function Home() {
   return (
     <AppShell tab={tab} setTab={setTab}>
       {tab === 'wallet' ? <WalletPanel /> : <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <Stats play={selected.size * STAKE} pot={(taken.size + selected.size) * 40} cardsTaken={taken.size + selected.size} />
+        <Stats play={selected.size * STAKE} pot={Number(round?.pot ?? '0')} cardsTaken={taken.size} />
         <SoundCountdown muted={muted} onToggle={() => setMuted((value) => !value)} countdown={countdown} />
         <div className="min-h-0 flex-1 overflow-y-auto"><NumberGrid selected={selected} taken={taken} onToggle={toggle} /></div>
         {selectedCards.length > 0 && <div className="pointer-events-none absolute bottom-[74px] left-0 right-0 z-10 flex gap-2 overflow-hidden bg-gradient-to-t from-[hsl(161_42%_9%)] to-transparent px-3 pb-2 pt-8">{selectedCards.map((id) => <MiniCard key={id} id={id} grid={buildCard(id)} />)}</div>}
-        {showWarning && <div role="alert" data-testid="status-card-limit" className="absolute left-4 right-4 top-24 z-30 rounded-2xl border border-[hsl(var(--primary)/.6)] bg-[hsl(161_35%_15%/.98)] px-4 py-3 text-center text-sm font-bold text-[hsl(var(--primary))] shadow-xl animate-rise-in">ከ4 ካርድ በላይ መምረጥ አይችሉም</div>}
+        {showWarning && <div role="alert" data-testid="status-card-limit" className="absolute left-4 right-4 top-24 z-30 rounded-2xl border border-[hsl(var(--primary)/.6)] bg-[hsl(161_35%_15%/.98)] px-4 py-3 text-center text-sm font-bold text-[hsl(var(--primary))] shadow-xl animate-rise-in">{warningMessage || 'ከ4 ካርድ በላይ መምረጥ አይችሉም'}</div>}
       </div>}
     </AppShell>
   );

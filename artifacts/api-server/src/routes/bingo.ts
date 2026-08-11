@@ -1,5 +1,5 @@
 import { and, asc, eq, inArray } from "drizzle-orm";
-import { db, bingoCalls, bingoPlayerCards, bingoRounds, telegramUsers } from "@workspace/db";
+import { db, bingoCalls, bingoPayouts, bingoPlayerCards, bingoRounds, telegramUsers, walletTransactions } from "@workspace/db";
 import { Router, type IRouter, type Request } from "express";
 import { isValidTelegramInitData, parseTelegramUser } from "./telegram";
 import { logger } from "../lib/logger";
@@ -9,6 +9,7 @@ const router: IRouter = Router();
 const MAX_CARDS = 4;
 const CARD_COUNT = 150;
 const DEFAULT_BINGO_PAYOUT = "2280.00";
+const CARD_STAKE = 4;
 
 function getBingoPayoutAmount() {
   const configured = process.env["BINGO_PAYOUT_AMOUNT"]?.trim();
@@ -27,13 +28,26 @@ function winnerCard(grid: Array<number | "star">, called: Set<number>) {
   return lines.some((line) => line.every((index) => marked(grid[index]!))) || corners.every((index) => marked(grid[index]!));
 }
 
-async function resolveRoundWinner(roundId: number, calls: Array<{ number: number }>, cards: Array<{ id: number; telegramId: number; cardNumber: number; grid: Array<number | "star"> }>) {
-  const called = new Set(calls.map((call) => call.number));
-  const winner = [...cards].sort((left, right) => left.id - right.id).find((card) => winnerCard(card.grid, called));
-  if (!winner) return undefined;
-  const result = await awardBingoPayout({ roundId, cardId: winner.id, telegramId: winner.telegramId, amount: getBingoPayoutAmount() });
-  const player = await db.query.telegramUsers.findFirst({ where: eq(telegramUsers.telegramId, winner.telegramId), columns: { firstName: true, lastName: true } });
-  return { telegramId: winner.telegramId, name: [player?.firstName, player?.lastName].filter(Boolean).join(" "), cardNumber: winner.cardNumber, payout: result.payout.amount, status: result.payout.status };
+async function resolveRoundWinner(roundId: number) {
+  return db.transaction(async (tx) => {
+    const [round] = await tx.select().from(bingoRounds).where(eq(bingoRounds.id, roundId)).for("update").limit(1);
+    if (!round) return undefined;
+    const calls = await tx.select({ number: bingoCalls.number }).from(bingoCalls).where(eq(bingoCalls.roundId, roundId));
+    const cards = await tx.select({ id: bingoPlayerCards.id, telegramId: bingoPlayerCards.telegramId, cardNumber: bingoPlayerCards.cardNumber, grid: bingoPlayerCards.grid }).from(bingoPlayerCards).where(eq(bingoPlayerCards.roundId, roundId));
+    let winner = [...cards].sort((left, right) => left.id - right.id).find((card) => winnerCard(card.grid, new Set(calls.map((call) => call.number))));
+    if (!winner && round.status === "completed") {
+      const [payout] = await tx.select().from(bingoPayouts).where(eq(bingoPayouts.roundId, roundId)).limit(1);
+      if (payout) winner = cards.find((card) => card.id === payout.cardId);
+      if (!winner) return undefined;
+      const player = await tx.select({ firstName: telegramUsers.firstName, lastName: telegramUsers.lastName }).from(telegramUsers).where(eq(telegramUsers.telegramId, winner.telegramId)).limit(1);
+      return { telegramId: winner.telegramId, name: [player[0]?.firstName, player[0]?.lastName].filter(Boolean).join(" "), cardNumber: winner.cardNumber, payout: payout!.amount, status: payout!.status };
+    }
+    if (!winner || round.status !== "active") return undefined;
+    const result = await awardBingoPayout({ roundId, cardId: winner.id, telegramId: winner.telegramId, amount: getBingoPayoutAmount() });
+    await tx.update(bingoRounds).set({ status: "completed", completedAt: new Date() }).where(and(eq(bingoRounds.id, roundId), eq(bingoRounds.status, "active")));
+    const player = await tx.select({ firstName: telegramUsers.firstName, lastName: telegramUsers.lastName }).from(telegramUsers).where(eq(telegramUsers.telegramId, winner.telegramId)).limit(1);
+    return { telegramId: winner.telegramId, name: [player[0]?.firstName, player[0]?.lastName].filter(Boolean).join(" "), cardNumber: winner.cardNumber, payout: result.payout.amount, status: result.payout.status };
+  });
 }
 
 function shuffledNumbers() {
@@ -72,11 +86,13 @@ export async function advanceBingoRound() {
   const round = await ensureActiveBingoRound();
   const calls = await db.query.bingoCalls.findMany({ where: eq(bingoCalls.roundId, round.id), orderBy: [asc(bingoCalls.position)] });
   if (calls.length >= 75) {
-    await db.update(bingoRounds).set({ status: "completed", completedAt: new Date() }).where(and(eq(bingoRounds.id, round.id), eq(bingoRounds.status, "active")));
+    const winner = await resolveRoundWinner(round.id);
+    if (!winner) await db.update(bingoRounds).set({ status: "completed", completedAt: new Date() }).where(and(eq(bingoRounds.id, round.id), eq(bingoRounds.status, "active")));
     return ensureActiveBingoRound();
   }
   const remaining = shuffledNumbers().filter((number) => !calls.some((call) => call.number === number));
   await db.insert(bingoCalls).values({ roundId: round.id, number: remaining[0]!, position: calls.length });
+  await resolveRoundWinner(round.id);
   return round;
 }
 
@@ -96,8 +112,8 @@ router.get("/bingo/round", async (_req, res) => {
       db.query.bingoCalls.findMany({ where: eq(bingoCalls.roundId, round.id), orderBy: [asc(bingoCalls.position)] }),
       db.query.bingoPlayerCards.findMany({ where: eq(bingoPlayerCards.roundId, round.id), columns: { id: true, telegramId: true, cardNumber: true, grid: true } }),
     ]);
-    const winner = await resolveRoundWinner(round.id, calls, cards);
-    res.json({ id: round.id, status: round.status, startedAt: round.startedAt, calls: calls.map((call) => ({ number: call.number, position: call.position, calledAt: call.calledAt })), takenCardNumbers: cards.map((card) => card.cardNumber), winner });
+    const winner = await resolveRoundWinner(round.id);
+    res.json({ id: round.id, status: round.status, startedAt: round.startedAt, calls: calls.map((call) => ({ number: call.number, position: call.position, calledAt: call.calledAt })), takenCardNumbers: cards.map((card) => card.cardNumber), pot: (cards.length * CARD_STAKE).toFixed(2), winner });
   } catch (error) {
     logger.error({ err: error }, "Failed to load Bingo round");
     res.status(503).json({ error: "Bingo round unavailable" });
@@ -120,15 +136,41 @@ router.post("/bingo/cards", async (req, res) => {
     res.status(400).json({ error: `Choose between 1 and ${MAX_CARDS} unique cards from 1 to ${CARD_COUNT}` }); return;
   }
   const round = await ensureActiveBingoRound();
-  const existing = await db.query.bingoPlayerCards.findMany({ where: and(eq(bingoPlayerCards.roundId, round.id), inArray(bingoPlayerCards.cardNumber, cardNumbers)), columns: { cardNumber: true, telegramId: true } });
-  const takenByOther = existing.find((card) => card.telegramId !== user.telegramId);
-  if (takenByOther) { res.status(409).json({ error: `Card ${takenByOther.cardNumber} is already taken` }); return; }
-  const current = await db.query.bingoPlayerCards.findMany({ where: and(eq(bingoPlayerCards.roundId, round.id), eq(bingoPlayerCards.telegramId, user.telegramId)), columns: { cardNumber: true } });
-  if (current.length + cardNumbers.filter((number) => !current.some((card) => card.cardNumber === number)).length > MAX_CARDS) { res.status(400).json({ error: `You can select at most ${MAX_CARDS} cards` }); return; }
-  const missing = cardNumbers.filter((number) => !current.some((card) => card.cardNumber === number));
-  if (missing.length) await db.insert(bingoPlayerCards).values(missing.map((cardNumber) => ({ roundId: round.id, telegramId: user.telegramId, cardNumber, grid: buildCard(cardNumber) })));
-  const cards = await db.query.bingoPlayerCards.findMany({ where: and(eq(bingoPlayerCards.roundId, round.id), eq(bingoPlayerCards.telegramId, user.telegramId)), orderBy: [asc(bingoPlayerCards.cardNumber)] });
-  res.status(201).json({ roundId: round.id, cards });
+  try {
+    const result = await db.transaction(async (tx) => {
+      const [lockedRound] = await tx.select().from(bingoRounds).where(and(eq(bingoRounds.id, round.id), eq(bingoRounds.status, "active"))).for("update").limit(1);
+      const [lockedUser] = await tx.select().from(telegramUsers).where(eq(telegramUsers.telegramId, user.telegramId)).for("update").limit(1);
+      if (!lockedUser || !lockedRound) throw Object.assign(new Error("Bingo round is no longer active"), { status: 409 });
+      const existing = await tx.select({ cardNumber: bingoPlayerCards.cardNumber, telegramId: bingoPlayerCards.telegramId }).from(bingoPlayerCards).where(and(eq(bingoPlayerCards.roundId, lockedRound.id), inArray(bingoPlayerCards.cardNumber, cardNumbers))).for("update");
+      const takenByOther = existing.find((card) => card.telegramId !== user.telegramId);
+      if (takenByOther) throw Object.assign(new Error(`Card ${takenByOther.cardNumber} is already taken`), { status: 409 });
+      const current = await tx.select({ cardNumber: bingoPlayerCards.cardNumber }).from(bingoPlayerCards).where(and(eq(bingoPlayerCards.roundId, lockedRound.id), eq(bingoPlayerCards.telegramId, user.telegramId))).for("update");
+      const missing = cardNumbers.filter((number) => !current.some((card) => card.cardNumber === number));
+      if (current.length + missing.length > MAX_CARDS) throw Object.assign(new Error(`You can select at most ${MAX_CARDS} cards`), { status: 400 });
+      const reference = `bingo_purchase:${lockedRound.id}:${user.telegramId}:${missing.slice().sort((a, b) => a - b).join(",")}`;
+      const [ledger] = await tx.select().from(walletTransactions).where(eq(walletTransactions.reference, reference)).limit(1);
+      if (ledger) {
+        const cards = await tx.select().from(bingoPlayerCards).where(and(eq(bingoPlayerCards.roundId, lockedRound.id), eq(bingoPlayerCards.telegramId, user.telegramId))).orderBy(asc(bingoPlayerCards.cardNumber));
+        return { cards, balance: ledger.balanceAfter };
+      }
+      const total = missing.length * CARD_STAKE;
+      const before = Number(lockedUser.playWalletBalance);
+      if (before < total) throw Object.assign(new Error("Insufficient play wallet balance"), { status: 402 });
+      if (missing.length) await tx.insert(bingoPlayerCards).values(missing.map((cardNumber) => ({ roundId: lockedRound.id, telegramId: user.telegramId, cardNumber, grid: buildCard(cardNumber) })));
+      const after = (before - total).toFixed(2);
+      await tx.update(telegramUsers).set({ playWalletBalance: after, updatedAt: new Date() }).where(eq(telegramUsers.telegramId, user.telegramId));
+      if (total > 0) await tx.insert(walletTransactions).values({ telegramId: user.telegramId, type: "adjustment", amount: (-total).toFixed(2), balanceBefore: before.toFixed(2), balanceAfter: after, status: "completed", reference, metadata: { roundId: lockedRound.id, cardNumbers: missing, stake: CARD_STAKE } });
+      const cards = await tx.select().from(bingoPlayerCards).where(and(eq(bingoPlayerCards.roundId, lockedRound.id), eq(bingoPlayerCards.telegramId, user.telegramId))).orderBy(asc(bingoPlayerCards.cardNumber));
+      return { cards, balance: after };
+    });
+    res.status(201).json({ roundId: round.id, cards: result.cards, playWalletBalance: result.balance });
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    if (status) { res.status(status).json({ error: (error as Error).message }); return; }
+    if ((error as { code?: string }).code === "23505") { res.status(409).json({ error: "One of the selected cards was just taken" }); return; }
+    logger.error({ err: error }, "Failed to purchase Bingo cards");
+    res.status(503).json({ error: "Bingo card purchase unavailable" });
+  }
 });
 
 export function startBingoRoundInterval() {
