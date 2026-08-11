@@ -1,6 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { db, telegramUsers } from "@workspace/db";
+import { db, depositRequests, telegramUsers, withdrawalRequests } from "@workspace/db";
 import { Router, type IRouter, type Request } from "express";
 import { logger } from "../lib/logger";
 
@@ -248,17 +248,25 @@ async function submitWithdrawalRequest(
   phone: string,
   ownerName: string,
 ) {
-  const adminChatId = getAdminChatId();
-  if (!adminChatId) {
-    logger.error("TELEGRAM_ADMIN_CHAT_ID is not configured");
-    await telegramRequest("sendMessage", {
-      chat_id: chatId,
-      text: "የወጪ ጥያቄዎን ማስገባት አልተቻለም። እባክዎ ቆይተው እንደገና ይሞክሩ።",
-    });
+  const telegramId = user?.id;
+  if (!telegramId) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "መጀመሪያ እባክዎ ይመዝገቡ።" });
     return;
   }
-
-  await telegramRequest("sendMessage", {
+  const [request] = await db.insert(withdrawalRequests).values({
+    telegramId,
+    amount: amount.toFixed(2),
+    phone,
+    ownerName,
+    status: "pending",
+  }).onConflictDoNothing({ target: [withdrawalRequests.telegramId, withdrawalRequests.amount, withdrawalRequests.phone, withdrawalRequests.ownerName] }).returning({ id: withdrawalRequests.id });
+  if (!request) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "ይህ የወጪ ጥያቄ ቀድሞ ተመዝግቧል።" });
+    withdrawalSessions.delete(chatId);
+    return;
+  }
+  const adminChatId = getAdminChatId();
+  if (adminChatId) await telegramRequest("sendMessage", {
     chat_id: adminChatId,
     text: `💸 አዲስ የወጪ ጥያቄ\n\nተጠቃሚ: ${user?.first_name ?? "Unknown"}${user?.username ? ` (@${user.username})` : ""}\nTelegram ID: ${user?.id ?? "Unknown"}\nChat ID: ${chatId}\nመጠን: ${amount} ETB\nTelebirr ቁጥር: ${phone}\nየአካውንት ባለቤት: ${ownerName}`,
   });
@@ -296,17 +304,25 @@ async function sendTelebirrPaymentInstructions(chatId: number, amount: number) {
 }
 
 async function submitDepositRequest(chatId: number, user: TelegramUser | undefined, amount: number, transactionId: string) {
-  const adminChatId = getAdminChatId();
-  if (!adminChatId) {
-    logger.error("TELEGRAM_ADMIN_CHAT_ID is not configured");
-    await telegramRequest("sendMessage", {
-      chat_id: chatId,
-      text: "የሂሳብ መሙያ ጥያቄዎን ማስገባት አልተቻለም። እባክዎ ቆይተው እንደገና ይሞክሩ።",
-    });
+  const telegramId = user?.id;
+  if (!telegramId) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "መጀመሪያ እባክዎ ይመዝገቡ።" });
     return;
   }
-
-  await telegramRequest("sendMessage", {
+  const [request] = await db.insert(depositRequests).values({
+    telegramId,
+    amount: amount.toFixed(2),
+    paymentMethod: "telebirr",
+    transactionId: transactionId.trim(),
+    status: "pending",
+  }).onConflictDoNothing({ target: [depositRequests.paymentMethod, depositRequests.transactionId] }).returning({ id: depositRequests.id });
+  if (!request) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "ይህ የTransaction ID ቀድሞ ተመዝግቧል።" });
+    depositSessions.delete(chatId);
+    return;
+  }
+  const adminChatId = getAdminChatId();
+  if (adminChatId) await telegramRequest("sendMessage", {
     chat_id: adminChatId,
     text: `💰 አዲስ የቴሌብር ዲፖዚት ጥያቄ\n\nተጠቃሚ: ${user?.first_name ?? "Unknown"}${user?.username ? ` (@${user.username})` : ""}\nTelegram ID: ${user?.id ?? "Unknown"}\nChat ID: ${chatId}\nመጠን: ${amount} ETB\nTransaction ID: ${transactionId}`,
   });

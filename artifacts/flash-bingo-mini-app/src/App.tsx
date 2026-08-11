@@ -299,7 +299,12 @@ function telegramHeaders(): Record<string, string> {
   return initData ? { 'x-telegram-init-data': initData } : {};
 }
 
-type RoundData = { id: number; calls: Array<{ number: number; position: number; calledAt: string }>; takenCardNumbers: number[] };
+type RoundData = {
+  id: number;
+  calls: Array<{ number: number; position: number; calledAt: string }>;
+  takenCardNumbers: number[];
+  winner?: { name?: string; cardNumber: number; payout: string; status: string };
+};
 type ServerCard = { id?: number; cardNumber: number; grid: Cell[] };
 
 function Home() {
@@ -398,7 +403,7 @@ function PlayCard({ id, grid, called, winner, winnerEffect = 0, finalNumber }: {
   return <section className={`depth-card rounded-2xl border bg-[hsl(161_35%_15%)] p-2.5 transition-transform hover:-translate-y-0.5 ${winner ? 'winner-card border-[hsl(var(--primary))]' : 'border-[hsl(var(--primary)/.35)]'}`}><div className="mb-2 flex items-center justify-between"><span className="font-mono text-xs font-bold text-[hsl(var(--primary))]">CARD #{id}</span><span className="text-[10px] font-bold text-[hsl(var(--muted-foreground))]">{marked}/25</span></div><div className="mb-1 grid grid-cols-5 gap-1 text-center text-[9px] font-extrabold text-[hsl(var(--primary))]"><span>B</span><span>I</span><span>N</span><span>G</span><span>O</span></div><div className="grid grid-cols-5 gap-1">{grid.map((cell, index) => { const hit = cell === 'star' || (typeof cell === 'number' && called.has(cell)); const onLine = winner?.line.includes(index); const isCorner = winner?.corners.includes(index); const isFinalNumber = typeof cell === 'number' && cell === finalNumber; const effectClass = onLine ? `winner-line-cell winner-effect-${winnerEffect}` : isCorner ? 'winner-corner-cell' : hit ? 'called-number' : ''; const finalEffectClass = isFinalNumber ? `winner-final-number winner-effect-${winnerEffect}` : ''; return <div key={`${id}-${index}`} data-testid={`cell-card-${id}-${index}`} className={`grid aspect-square place-items-center rounded-md text-[11px] font-bold transition-all duration-300 ${effectClass} ${finalEffectClass} ${onLine ? 'bg-[hsl(var(--destructive))] text-[hsl(var(--foreground))]' : isCorner ? 'bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))]' : hit ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] shadow-[0_2px_0_hsl(152_61%_30%)]' : 'bg-[hsl(159_22%_22%)] text-[hsl(var(--foreground)/.8)]'}`}>{cell === 'star' ? '✦' : cell}</div>; })}</div></section>;
 }
 
-function WinnerModal({ card, called, pattern, winnerEffect, prize }: { card: { id: number; grid: Cell[] }; called: Set<number>; pattern: WinnerPattern; winnerEffect: number; prize: number }) {
+function WinnerModal({ card, called, pattern, winnerEffect, prize, winnerName }: { card: { id: number; grid: Cell[] }; called: Set<number>; pattern: WinnerPattern; winnerEffect: number; prize: string; winnerName: string }) {
   return (
     <div className='winner-overlay fixed inset-0 z-50 flex items-center justify-center overflow-y-auto px-4 py-8' role='dialog' aria-modal='true' aria-label='Bingo winner'>
       <div className='winner-confetti' aria-hidden='true'>
@@ -408,8 +413,8 @@ function WinnerModal({ card, called, pattern, winnerEffect, prize }: { card: { i
         <div className='winner-trophy' aria-hidden='true'>🏆</div>
         <p className='winner-title'>BINGO WINNER!</p>
         <p className='winner-prize-label'>TOTAL PRIZE</p>
-        <p className='winner-prize'>{prize.toLocaleString("en-US", { minimumFractionDigits: 2 })} <span>ብር</span></p>
-        <div className='winner-summary'>Name: <strong>ዜድ</strong> <span>|</span> Card: <strong>#{card.id}</strong></div>
+        <p className='winner-prize'>{Number(prize).toLocaleString("en-US", { minimumFractionDigits: 2 })} <span>ብር</span></p>
+        <div className='winner-summary'>Name: <strong>{winnerName || '—'}</strong> <span>|</span> Card: <strong>#{card.id}</strong></div>
         <div className='winner-card-frame'>
           <PlayCard id={card.id} grid={card.grid} called={called} winner={pattern} winnerEffect={winnerEffect} finalNumber={Array.from(called).at(-1)} />
         </div>
@@ -443,9 +448,16 @@ function Play() {
     const timer = window.setInterval(() => { void load().catch(() => undefined); }, CALL_INTERVAL);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [roundId]);
-  const winnerMatch = useMemo(() => cards.map((card) => ({ card, pattern: findWinnerPattern(card.grid, called) })).find(({ pattern }) => pattern) ?? null, [called, cards]);
-  useEffect(() => { if (!winnerMatch) return; const timer = window.setTimeout(() => setLocation('/'), 6000); return () => window.clearTimeout(timer); }, [setLocation, winnerMatch]);
-  return <AppShell tab={tab} setTab={setTab}>{tab === 'wallet' ? <WalletPanel /> : <div className="min-h-0 flex-1 overflow-y-auto bg-[linear-gradient(180deg,hsl(161_42%_9%),hsl(161_48%_7%))] p-3"><div className="space-y-3"><CalledBoard called={called} latest={current} /><CalledPanel current={current} muted={muted} onToggle={() => setMuted((value) => !value)} callIndex={round?.calls.length ?? 0} called={called} /><div className="grid grid-cols-2 gap-2.5">{cards.map((card) => { const pattern = winnerMatch?.card.id === card.id ? winnerMatch.pattern : null; return <PlayCard key={card.id} {...card} called={called} winner={pattern} />; })}</div><div className="flex items-center justify-center gap-2 pb-2 text-[11px] text-[hsl(var(--muted-foreground))]"><Sparkles className="h-3.5 w-3.5 text-[hsl(var(--primary))]" /> ቁጥሮች በየ 3 ሰከንዱ ይጠራሉ</div></div></div>}{winnerMatch && <WinnerModal card={winnerMatch.card} called={called} pattern={winnerMatch.pattern!} winnerEffect={winnerEffect} prize={2280} />}</AppShell>;
+  const serverWinner = round?.winner;
+  const winnerMatch = useMemo(() => {
+    if (!serverWinner) return null;
+    const card = cards.find((item) => item.id === serverWinner.cardNumber);
+    if (!card) return null;
+    const pattern = findWinnerPattern(card.grid, called);
+    return pattern ? { card, pattern } : null;
+  }, [called, cards, serverWinner]);
+  useEffect(() => { if (!winnerMatch) return; const timer = window.setTimeout(() => setLocation('/'), 6000); return () => window.clearTimeout(timer); }, [setLocation, winnerMatch?.card.id, serverWinner?.payout]);
+  return <AppShell tab={tab} setTab={setTab}>{tab === 'wallet' ? <WalletPanel /> : <div className="min-h-0 flex-1 overflow-y-auto bg-[linear-gradient(180deg,hsl(161_42%_9%),hsl(161_48%_7%))] p-3"><div className="space-y-3"><CalledBoard called={called} latest={current} /><CalledPanel current={current} muted={muted} onToggle={() => setMuted((value) => !value)} callIndex={round?.calls.length ?? 0} called={called} /><div className="grid grid-cols-2 gap-2.5">{cards.map((card) => { const pattern = winnerMatch?.card.id === card.id ? winnerMatch.pattern : null; return <PlayCard key={card.id} {...card} called={called} winner={pattern} />; })}</div><div className="flex items-center justify-center gap-2 pb-2 text-[11px] text-[hsl(var(--muted-foreground))]"><Sparkles className="h-3.5 w-3.5 text-[hsl(var(--primary))]" /> ቁጥሮች በየ 3 ሰከንዱ ይጠራሉ</div></div></div>}{winnerMatch && serverWinner && <WinnerModal card={winnerMatch.card} called={called} pattern={winnerMatch.pattern!} winnerEffect={winnerEffect} prize={serverWinner.payout} winnerName={serverWinner.name ?? ''} />}</AppShell>;
 }
 
 function AppShell({ children, tab, setTab }: { children: ReactNode; tab: Tab; setTab: (tab: Tab) => void }) {

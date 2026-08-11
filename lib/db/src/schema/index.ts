@@ -19,3 +19,7 @@
 
 export * from "./telegram-users";
 export * from "./bingo";
+export * from "./wallet-transactions";
+export * from "./deposit-requests";
+export * from "./withdrawal-requests";
+export * from "./bingo-payouts";
