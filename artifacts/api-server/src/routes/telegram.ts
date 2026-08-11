@@ -1,6 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { eq } from "drizzle-orm";
-import { db, depositRequests, telegramUsers, withdrawalRequests } from "@workspace/db";
+import { and, desc, eq } from "drizzle-orm";
+import {
+  db,
+  depositRequests,
+  telegramUsers,
+  walletTransactions,
+  withdrawalRequests,
+} from "@workspace/db";
 import { Router, type IRouter, type Request } from "express";
 import { logger } from "../lib/logger";
 
@@ -31,7 +37,8 @@ type TelegramUpdate = {
   callback_query?: {
     id: string;
     data?: string;
-    message?: { chat: { id: number } };
+    from?: TelegramUser;
+    message?: { chat: { id: number }; message_id: number };
   };
 };
 
@@ -352,6 +359,118 @@ async function sendMiniAppLink(chatId: number) {
   });
 }
 
+function getAdminApprovalKeyboard(type: "deposit" | "withdrawal", id: number) {
+  return {
+    inline_keyboard: [[
+      { text: "Approve", callback_data: `${type}:approve:${id}` },
+      { text: "Reject", callback_data: `${type}:reject:${id}` },
+    ]],
+  };
+}
+
+async function sendPendingRequests(chatId: number) {
+  const [deposits, withdrawals] = await Promise.all([
+    db.query.depositRequests.findMany({
+      where: eq(depositRequests.status, "pending"),
+      orderBy: [desc(depositRequests.createdAt)],
+    }),
+    db.query.withdrawalRequests.findMany({
+      where: eq(withdrawalRequests.status, "pending"),
+      orderBy: [desc(withdrawalRequests.createdAt)],
+    }),
+  ]);
+
+  if (deposits.length === 0 && withdrawals.length === 0) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "No pending deposit or withdrawal requests." });
+    return;
+  }
+
+  await telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text: `Pending requests: ${deposits.length} deposit(s), ${withdrawals.length} withdrawal(s).`,
+  });
+  for (const request of deposits) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: `Deposit #${request.id}\nTelegram ID: ${request.telegramId}\nAmount: ${request.amount} ETB\nPayment: ${request.paymentMethod}\nTransaction ID: ${request.transactionId}`,
+      reply_markup: getAdminApprovalKeyboard("deposit", request.id),
+    });
+  }
+  for (const request of withdrawals) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: `Withdrawal #${request.id}\nTelegram ID: ${request.telegramId}\nAmount: ${request.amount} ETB\nTelebirr: ${request.phone}\nOwner: ${request.ownerName}`,
+      reply_markup: getAdminApprovalKeyboard("withdrawal", request.id),
+    });
+  }
+}
+
+async function notifyWalletRequestUser(telegramId: number, text: string) {
+  const user = await db.query.telegramUsers.findFirst({
+    where: eq(telegramUsers.telegramId, telegramId),
+    columns: { chatId: true },
+  });
+  if (user) await telegramRequest("sendMessage", { chat_id: user.chatId, text });
+}
+
+async function processAdminDecision(type: "deposit" | "withdrawal", action: "approve" | "reject", id: number, adminChatId: number) {
+  let outcome = "Request was already processed.";
+  let userNotification: { telegramId: number; text: string } | undefined;
+  await db.transaction(async (tx) => {
+    const request = type === "deposit"
+      ? (await tx.select().from(depositRequests).where(and(eq(depositRequests.id, id), eq(depositRequests.status, "pending"))).for("update").limit(1))[0]
+      : (await tx.select().from(withdrawalRequests).where(and(eq(withdrawalRequests.id, id), eq(withdrawalRequests.status, "pending"))).for("update").limit(1))[0];
+    if (!request) return;
+
+    const user = (await tx.select().from(telegramUsers).where(eq(telegramUsers.telegramId, request.telegramId)).for("update").limit(1))[0];
+    if (!user) {
+      outcome = "The request user no longer exists.";
+      return;
+    }
+    if (action === "reject") {
+      const updatedAt = new Date();
+      if (type === "deposit") await tx.update(depositRequests).set({ status: "rejected", updatedAt }).where(and(eq(depositRequests.id, id), eq(depositRequests.status, "pending")));
+      else await tx.update(withdrawalRequests).set({ status: "rejected", updatedAt }).where(and(eq(withdrawalRequests.id, id), eq(withdrawalRequests.status, "pending")));
+      outcome = `Request #${id} rejected.`;
+      userNotification = { telegramId: request.telegramId, text: type === "deposit" ? `Your deposit request #${id} was rejected.` : `Your withdrawal request #${id} was rejected.` };
+      return;
+    }
+
+    const amount = Number(request.amount);
+    const before = Number(type === "deposit" ? user.playWalletBalance : user.winWalletBalance);
+    if (type === "withdrawal" && before < amount) {
+      await tx.update(withdrawalRequests).set({ status: "rejected", updatedAt: new Date() }).where(and(eq(withdrawalRequests.id, id), eq(withdrawalRequests.status, "pending")));
+      outcome = `Withdrawal #${id} rejected: insufficient win wallet balance.`;
+      userNotification = { telegramId: request.telegramId, text: `Your withdrawal request #${id} was rejected because your win wallet balance is insufficient.` };
+      return;
+    }
+
+    const after = type === "deposit" ? before + amount : before - amount;
+    const reference = `${type}-request-${id}`;
+    await tx.insert(walletTransactions).values({
+      telegramId: request.telegramId,
+      type,
+      amount: request.amount,
+      balanceBefore: before.toFixed(2),
+      balanceAfter: after.toFixed(2),
+      status: "completed",
+      reference,
+      metadata: { requestId: id, approvedBy: adminChatId, source: "telegram_admin" },
+    });
+    await tx.update(telegramUsers).set({
+      ...(type === "deposit" ? { playWalletBalance: after.toFixed(2) } : { winWalletBalance: after.toFixed(2) }),
+      updatedAt: new Date(),
+    }).where(eq(telegramUsers.telegramId, request.telegramId));
+    const updatedAt = new Date();
+    if (type === "deposit") await tx.update(depositRequests).set({ status: "approved", updatedAt }).where(and(eq(depositRequests.id, id), eq(depositRequests.status, "pending")));
+    else await tx.update(withdrawalRequests).set({ status: "approved", updatedAt }).where(and(eq(withdrawalRequests.id, id), eq(withdrawalRequests.status, "pending")));
+    outcome = `Request #${id} approved.`;
+    userNotification = { telegramId: request.telegramId, text: type === "deposit" ? `Your deposit request #${id} was approved. ${amount.toFixed(2)} ETB was added to your play wallet.` : `Your withdrawal request #${id} was approved. ${amount.toFixed(2)} ETB was deducted from your win wallet.` };
+  });
+  if (userNotification) await notifyWalletRequestUser(userNotification.telegramId, userNotification.text);
+  await telegramRequest("sendMessage", { chat_id: adminChatId, text: outcome });
+}
+
 async function saveTelegramContact(message: NonNullable<TelegramUpdate["message"]>) {
   const contact = message.contact;
   const user = message.from;
@@ -400,9 +519,18 @@ async function saveTelegramContact(message: NonNullable<TelegramUpdate["message"
 async function handleTelegramUpdate(update: TelegramUpdate) {
   const callbackQuery = update.callback_query;
   if (callbackQuery) {
+    const adminChatId = getAdminChatId();
+    const callbackChatId = callbackQuery.message?.chat.id;
+    const decision = callbackQuery.data?.match(/^(deposit|withdrawal):(approve|reject):(\d+)$/);
+    if (decision && (!adminChatId || callbackChatId !== adminChatId)) {
+      await telegramRequest("answerCallbackQuery", { callback_query_id: callbackQuery.id, text: "Unauthorized.", show_alert: true });
+      return;
+    }
     await telegramRequest("answerCallbackQuery", { callback_query_id: callbackQuery.id });
     if (callbackQuery.data === "deposit:telebirr" && callbackQuery.message) {
       await sendTelebirrAmountPrompt(callbackQuery.message.chat.id);
+    } else if (decision && adminChatId) {
+      await processAdminDecision(decision[1] as "deposit" | "withdrawal", decision[2] as "approve" | "reject", Number(decision[3]), adminChatId);
     }
     return;
   }
@@ -415,6 +543,14 @@ async function handleTelegramUpdate(update: TelegramUpdate) {
 
   const text = message?.text?.trim();
   if (!message || !text) return;
+  if (text === "/pending") {
+    if (getAdminChatId() !== message.chat.id) {
+      await telegramRequest("sendMessage", { chat_id: message.chat.id, text: "Unauthorized." });
+      return;
+    }
+    await sendPendingRequests(message.chat.id);
+    return;
+  }
   if (text.startsWith("/start")) {
     await sendWelcomeMessage(message.chat.id, message.from?.first_name);
     return;
