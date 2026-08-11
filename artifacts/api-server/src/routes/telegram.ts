@@ -187,10 +187,12 @@ async function sendProfileAccountMessage(chatId: number, telegramId?: number) {
     : undefined;
   const name = user ? [user.firstName, user.lastName].filter(Boolean).join(" ") : "*****";
   const phone = user?.phoneNumber ? `${user.phoneNumber.slice(0, 2)}****` : "09****";
+  const playWallet = user?.playWalletBalance ?? "0.00";
+  const winWallet = user?.winWalletBalance ?? "0.00";
 
   await telegramRequest("sendMessage", {
     chat_id: chatId,
-    text: `👤 Profile & Account\n\n👤 ፕሮፋይል\n\nስም: ${name}\nስልክ: ${phone}\n\n💰 play wallet : 0 ETB\n🏆 win wallet : 0 ETB`,
+    text: `👤 Profile & Account\n\n👤 ፕሮፋይል\n\nስም: ${name}\nስልክ: ${phone}\n\n💰 play wallet : ${playWallet} ETB\n🏆 win wallet : ${winWallet} ETB`,
     reply_markup: getMainKeyboard(),
   });
 }
@@ -357,7 +359,7 @@ async function saveTelegramContact(message: NonNullable<TelegramUpdate["message"
   };
   const inserted = await db
     .insert(telegramUsers)
-    .values(registration)
+    .values({ ...registration, playWalletBalance: "10.00", winWalletBalance: "0.00" })
     .onConflictDoNothing({ target: telegramUsers.telegramId })
     .returning({ telegramId: telegramUsers.telegramId });
 
