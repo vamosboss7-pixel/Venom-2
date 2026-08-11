@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { db, telegramUsers } from "@workspace/db";
 import { Router, type IRouter, type Request } from "express";
 import { logger } from "../lib/logger";
@@ -177,6 +178,20 @@ async function sendContactPrompt(chatId: number) {
     chat_id: chatId,
     text: "ምዝገባን ለመጨረስ ከታች ያለውን ቁልፍ በመጫን የራስዎን Telegram contact ያጋሩ።",
     reply_markup: getContactKeyboard(),
+  });
+}
+
+async function sendProfileAccountMessage(chatId: number, telegramId?: number) {
+  const user = telegramId
+    ? await db.query.telegramUsers.findFirst({ where: eq(telegramUsers.telegramId, telegramId) })
+    : undefined;
+  const name = user ? [user.firstName, user.lastName].filter(Boolean).join(" ") : "*****";
+  const phone = user?.phoneNumber ? `${user.phoneNumber.slice(0, 2)}****` : "09****";
+
+  await telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text: `👤 Profile & Account\n\n👤 ፕሮፋይል\n\nስም: ${name}\nስልክ: ${phone}\n\n💰 play wallet : 0 ETB\n🏆 win wallet : 0 ETB`,
+    reply_markup: getMainKeyboard(),
   });
 }
 
@@ -484,7 +499,12 @@ async function handleTelegramUpdate(update: TelegramUpdate) {
     return;
   }
 
-  if (text === "🎁 Promo Code" || text === "👤 Profile & Account") {
+  if (text === "👤 Profile & Account") {
+    await sendProfileAccountMessage(message.chat.id, message.from?.id);
+    return;
+  }
+
+  if (text === "🎁 Promo Code") {
     await telegramRequest("sendMessage", {
       chat_id: message.chat.id,
       text: "ይህ አማራጭ በቅርቡ ይገኛል።",
