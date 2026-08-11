@@ -1,4 +1,4 @@
-import { bigint, pgTable, text, timestamp } from "drizzle-orm/pg-core";
+import { bigint, numeric, pgTable, text, timestamp } from "drizzle-orm/pg-core";
 
 export const telegramUsers = pgTable("telegram_users", {
   telegramId: bigint("telegram_id", { mode: "number" }).primaryKey(),
@@ -7,6 +7,8 @@ export const telegramUsers = pgTable("telegram_users", {
   lastName: text("last_name"),
   username: text("username"),
   phoneNumber: text("phone_number").notNull(),
+  playWalletBalance: numeric("play_wallet_balance", { precision: 12, scale: 2 }).notNull().default("0"),
+  winWalletBalance: numeric("win_wallet_balance", { precision: 12, scale: 2 }).notNull().default("0"),
   languageCode: text("language_code"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),

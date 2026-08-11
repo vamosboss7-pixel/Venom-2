@@ -1,5 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { db, telegramUsers } from "@workspace/db";
+import { and, desc, eq } from "drizzle-orm";
+import {
+  db,
+  depositRequests,
+  telegramUsers,
+  walletTransactions,
+  withdrawalRequests,
+} from "@workspace/db";
 import { Router, type IRouter, type Request } from "express";
 import { logger } from "../lib/logger";
 
@@ -30,7 +37,8 @@ type TelegramUpdate = {
   callback_query?: {
     id: string;
     data?: string;
-    message?: { chat: { id: number } };
+    from?: TelegramUser;
+    message?: { chat: { id: number }; message_id: number };
   };
 };
 
@@ -108,7 +116,7 @@ function isTelegramWebhookRequest(req: Request) {
   return Boolean(expectedSecret) && req.header("x-telegram-bot-api-secret-token") === expectedSecret;
 }
 
-function isValidTelegramInitData(initData: string, botToken: string) {
+export function isValidTelegramInitData(initData: string, botToken: string) {
   const params = new URLSearchParams(initData);
   const receivedHash = params.get("hash");
   const authDate = Number(params.get("auth_date"));
@@ -127,7 +135,7 @@ function isValidTelegramInitData(initData: string, botToken: string) {
   return receivedHashBuffer.length === calculatedHashBuffer.length && timingSafeEqual(receivedHashBuffer, calculatedHashBuffer);
 }
 
-function parseTelegramUser(initData: string) {
+export function parseTelegramUser(initData: string) {
   const userValue = new URLSearchParams(initData).get("user");
   if (!userValue) return undefined;
   try {
@@ -177,6 +185,22 @@ async function sendContactPrompt(chatId: number) {
     chat_id: chatId,
     text: "ምዝገባን ለመጨረስ ከታች ያለውን ቁልፍ በመጫን የራስዎን Telegram contact ያጋሩ።",
     reply_markup: getContactKeyboard(),
+  });
+}
+
+async function sendProfileAccountMessage(chatId: number, telegramId?: number) {
+  const user = telegramId
+    ? await db.query.telegramUsers.findFirst({ where: eq(telegramUsers.telegramId, telegramId) })
+    : undefined;
+  const name = user ? [user.firstName, user.lastName].filter(Boolean).join(" ") : "*****";
+  const phone = user?.phoneNumber ? `${user.phoneNumber.slice(0, 2)}****` : "09****";
+  const playWallet = user?.playWalletBalance ?? "0.00";
+  const winWallet = user?.winWalletBalance ?? "0.00";
+
+  await telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text: `👤 Profile & Account\n\n👤 ፕሮፋይል\n\nስም: ${name}\nስልክ: ${phone}\n\n💰 play wallet : ${playWallet} ETB\n🏆 win wallet : ${winWallet} ETB`,
+    reply_markup: getMainKeyboard(),
   });
 }
 
@@ -231,17 +255,25 @@ async function submitWithdrawalRequest(
   phone: string,
   ownerName: string,
 ) {
-  const adminChatId = getAdminChatId();
-  if (!adminChatId) {
-    logger.error("TELEGRAM_ADMIN_CHAT_ID is not configured");
-    await telegramRequest("sendMessage", {
-      chat_id: chatId,
-      text: "የወጪ ጥያቄዎን ማስገባት አልተቻለም። እባክዎ ቆይተው እንደገና ይሞክሩ።",
-    });
+  const telegramId = user?.id;
+  if (!telegramId) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "መጀመሪያ እባክዎ ይመዝገቡ።" });
     return;
   }
-
-  await telegramRequest("sendMessage", {
+  const [request] = await db.insert(withdrawalRequests).values({
+    telegramId,
+    amount: amount.toFixed(2),
+    phone,
+    ownerName,
+    status: "pending",
+  }).onConflictDoNothing({ target: [withdrawalRequests.telegramId, withdrawalRequests.amount, withdrawalRequests.phone, withdrawalRequests.ownerName] }).returning({ id: withdrawalRequests.id });
+  if (!request) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "ይህ የወጪ ጥያቄ ቀድሞ ተመዝግቧል።" });
+    withdrawalSessions.delete(chatId);
+    return;
+  }
+  const adminChatId = getAdminChatId();
+  if (adminChatId) await telegramRequest("sendMessage", {
     chat_id: adminChatId,
     text: `💸 አዲስ የወጪ ጥያቄ\n\nተጠቃሚ: ${user?.first_name ?? "Unknown"}${user?.username ? ` (@${user.username})` : ""}\nTelegram ID: ${user?.id ?? "Unknown"}\nChat ID: ${chatId}\nመጠን: ${amount} ETB\nTelebirr ቁጥር: ${phone}\nየአካውንት ባለቤት: ${ownerName}`,
   });
@@ -279,17 +311,25 @@ async function sendTelebirrPaymentInstructions(chatId: number, amount: number) {
 }
 
 async function submitDepositRequest(chatId: number, user: TelegramUser | undefined, amount: number, transactionId: string) {
-  const adminChatId = getAdminChatId();
-  if (!adminChatId) {
-    logger.error("TELEGRAM_ADMIN_CHAT_ID is not configured");
-    await telegramRequest("sendMessage", {
-      chat_id: chatId,
-      text: "የሂሳብ መሙያ ጥያቄዎን ማስገባት አልተቻለም። እባክዎ ቆይተው እንደገና ይሞክሩ።",
-    });
+  const telegramId = user?.id;
+  if (!telegramId) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "መጀመሪያ እባክዎ ይመዝገቡ።" });
     return;
   }
-
-  await telegramRequest("sendMessage", {
+  const [request] = await db.insert(depositRequests).values({
+    telegramId,
+    amount: amount.toFixed(2),
+    paymentMethod: "telebirr",
+    transactionId: transactionId.trim(),
+    status: "pending",
+  }).onConflictDoNothing({ target: [depositRequests.paymentMethod, depositRequests.transactionId] }).returning({ id: depositRequests.id });
+  if (!request) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "ይህ የTransaction ID ቀድሞ ተመዝግቧል።" });
+    depositSessions.delete(chatId);
+    return;
+  }
+  const adminChatId = getAdminChatId();
+  if (adminChatId) await telegramRequest("sendMessage", {
     chat_id: adminChatId,
     text: `💰 አዲስ የቴሌብር ዲፖዚት ጥያቄ\n\nተጠቃሚ: ${user?.first_name ?? "Unknown"}${user?.username ? ` (@${user.username})` : ""}\nTelegram ID: ${user?.id ?? "Unknown"}\nChat ID: ${chatId}\nመጠን: ${amount} ETB\nTransaction ID: ${transactionId}`,
   });
@@ -319,6 +359,118 @@ async function sendMiniAppLink(chatId: number) {
   });
 }
 
+function getAdminApprovalKeyboard(type: "deposit" | "withdrawal", id: number) {
+  return {
+    inline_keyboard: [[
+      { text: "Approve", callback_data: `${type}:approve:${id}` },
+      { text: "Reject", callback_data: `${type}:reject:${id}` },
+    ]],
+  };
+}
+
+async function sendPendingRequests(chatId: number) {
+  const [deposits, withdrawals] = await Promise.all([
+    db.query.depositRequests.findMany({
+      where: eq(depositRequests.status, "pending"),
+      orderBy: [desc(depositRequests.createdAt)],
+    }),
+    db.query.withdrawalRequests.findMany({
+      where: eq(withdrawalRequests.status, "pending"),
+      orderBy: [desc(withdrawalRequests.createdAt)],
+    }),
+  ]);
+
+  if (deposits.length === 0 && withdrawals.length === 0) {
+    await telegramRequest("sendMessage", { chat_id: chatId, text: "No pending deposit or withdrawal requests." });
+    return;
+  }
+
+  await telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text: `Pending requests: ${deposits.length} deposit(s), ${withdrawals.length} withdrawal(s).`,
+  });
+  for (const request of deposits) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: `Deposit #${request.id}\nTelegram ID: ${request.telegramId}\nAmount: ${request.amount} ETB\nPayment: ${request.paymentMethod}\nTransaction ID: ${request.transactionId}`,
+      reply_markup: getAdminApprovalKeyboard("deposit", request.id),
+    });
+  }
+  for (const request of withdrawals) {
+    await telegramRequest("sendMessage", {
+      chat_id: chatId,
+      text: `Withdrawal #${request.id}\nTelegram ID: ${request.telegramId}\nAmount: ${request.amount} ETB\nTelebirr: ${request.phone}\nOwner: ${request.ownerName}`,
+      reply_markup: getAdminApprovalKeyboard("withdrawal", request.id),
+    });
+  }
+}
+
+async function notifyWalletRequestUser(telegramId: number, text: string) {
+  const user = await db.query.telegramUsers.findFirst({
+    where: eq(telegramUsers.telegramId, telegramId),
+    columns: { chatId: true },
+  });
+  if (user) await telegramRequest("sendMessage", { chat_id: user.chatId, text });
+}
+
+async function processAdminDecision(type: "deposit" | "withdrawal", action: "approve" | "reject", id: number, adminChatId: number) {
+  let outcome = "Request was already processed.";
+  let userNotification: { telegramId: number; text: string } | undefined;
+  await db.transaction(async (tx) => {
+    const request = type === "deposit"
+      ? (await tx.select().from(depositRequests).where(and(eq(depositRequests.id, id), eq(depositRequests.status, "pending"))).for("update").limit(1))[0]
+      : (await tx.select().from(withdrawalRequests).where(and(eq(withdrawalRequests.id, id), eq(withdrawalRequests.status, "pending"))).for("update").limit(1))[0];
+    if (!request) return;
+
+    const user = (await tx.select().from(telegramUsers).where(eq(telegramUsers.telegramId, request.telegramId)).for("update").limit(1))[0];
+    if (!user) {
+      outcome = "The request user no longer exists.";
+      return;
+    }
+    if (action === "reject") {
+      const updatedAt = new Date();
+      if (type === "deposit") await tx.update(depositRequests).set({ status: "rejected", updatedAt }).where(and(eq(depositRequests.id, id), eq(depositRequests.status, "pending")));
+      else await tx.update(withdrawalRequests).set({ status: "rejected", updatedAt }).where(and(eq(withdrawalRequests.id, id), eq(withdrawalRequests.status, "pending")));
+      outcome = `Request #${id} rejected.`;
+      userNotification = { telegramId: request.telegramId, text: type === "deposit" ? `Your deposit request #${id} was rejected.` : `Your withdrawal request #${id} was rejected.` };
+      return;
+    }
+
+    const amount = Number(request.amount);
+    const before = Number(type === "deposit" ? user.playWalletBalance : user.winWalletBalance);
+    if (type === "withdrawal" && before < amount) {
+      await tx.update(withdrawalRequests).set({ status: "rejected", updatedAt: new Date() }).where(and(eq(withdrawalRequests.id, id), eq(withdrawalRequests.status, "pending")));
+      outcome = `Withdrawal #${id} rejected: insufficient win wallet balance.`;
+      userNotification = { telegramId: request.telegramId, text: `Your withdrawal request #${id} was rejected because your win wallet balance is insufficient.` };
+      return;
+    }
+
+    const after = type === "deposit" ? before + amount : before - amount;
+    const reference = `${type}-request-${id}`;
+    await tx.insert(walletTransactions).values({
+      telegramId: request.telegramId,
+      type,
+      amount: request.amount,
+      balanceBefore: before.toFixed(2),
+      balanceAfter: after.toFixed(2),
+      status: "completed",
+      reference,
+      metadata: { requestId: id, approvedBy: adminChatId, source: "telegram_admin" },
+    });
+    await tx.update(telegramUsers).set({
+      ...(type === "deposit" ? { playWalletBalance: after.toFixed(2) } : { winWalletBalance: after.toFixed(2) }),
+      updatedAt: new Date(),
+    }).where(eq(telegramUsers.telegramId, request.telegramId));
+    const updatedAt = new Date();
+    if (type === "deposit") await tx.update(depositRequests).set({ status: "approved", updatedAt }).where(and(eq(depositRequests.id, id), eq(depositRequests.status, "pending")));
+    else await tx.update(withdrawalRequests).set({ status: "approved", updatedAt }).where(and(eq(withdrawalRequests.id, id), eq(withdrawalRequests.status, "pending")));
+    outcome = `Request #${id} approved.`;
+    userNotification = { telegramId: request.telegramId, text: type === "deposit" ? `Your deposit request #${id} was approved. ${amount.toFixed(2)} ETB was added to your play wallet.` : `Your withdrawal request #${id} was approved. ${amount.toFixed(2)} ETB was deducted from your win wallet.` };
+  });
+  if (userNotification) await notifyWalletRequestUser(userNotification.telegramId, userNotification.text);
+  await telegramRequest("sendMessage", { chat_id: adminChatId, text: outcome });
+}
+
 async function saveTelegramContact(message: NonNullable<TelegramUpdate["message"]>) {
   const contact = message.contact;
   const user = message.from;
@@ -330,34 +482,36 @@ async function saveTelegramContact(message: NonNullable<TelegramUpdate["message"
     return;
   }
 
-  await db
+  const registration = {
+    telegramId: user.id,
+    chatId: message.chat.id,
+    firstName: contact.first_name || user.first_name,
+    lastName: contact.last_name ?? user.last_name ?? null,
+    username: user.username ?? null,
+    phoneNumber: contact.phone_number,
+    languageCode: user.language_code ?? null,
+    updatedAt: new Date(),
+  };
+  const inserted = await db
     .insert(telegramUsers)
-    .values({
-      telegramId: user.id,
-      chatId: message.chat.id,
-      firstName: contact.first_name || user.first_name,
-      lastName: contact.last_name ?? user.last_name ?? null,
-      username: user.username ?? null,
-      phoneNumber: contact.phone_number,
-      languageCode: user.language_code ?? null,
-      updatedAt: new Date(),
-    })
-    .onConflictDoUpdate({
-      target: telegramUsers.telegramId,
-      set: {
-        chatId: message.chat.id,
-        firstName: contact.first_name || user.first_name,
-        lastName: contact.last_name ?? user.last_name ?? null,
-        username: user.username ?? null,
-        phoneNumber: contact.phone_number,
-        languageCode: user.language_code ?? null,
-        updatedAt: new Date(),
-      },
-    });
+    .values({ ...registration, playWalletBalance: "10.00", winWalletBalance: "0.00" })
+    .onConflictDoNothing({ target: telegramUsers.telegramId })
+    .returning({ telegramId: telegramUsers.telegramId });
+
+  if (inserted.length === 0) {
+    await db
+      .update(telegramUsers)
+      .set(registration)
+      .where(eq(telegramUsers.telegramId, user.id));
+  }
+
+  const text = inserted.length > 0
+    ? `✅ እንኳን ደስ አለዎት ${registration.firstName}! ምዝገባዎ ተሳክቷል።\n\n🤑 የ10 ብር የPlay Wallet ገቢ ተደርጎልዎታል።\n\nአሁን Flash Bingoን መጫወት ይችላሉ።`
+    : "እርስዎ ቀድሞውኑ የFlash Bingo ተጠቃሚ ነዎት።\n\nበቀጥታ ወደ ጨዋታ መቀላቀል ይችላሉ።";
 
   await telegramRequest("sendMessage", {
     chat_id: message.chat.id,
-    text: `✅ እንኳን ደስ አለዎት ${user.first_name}! ምዝገባዎ ተሳክቷል።\n\nአሁን Flash Bingoን መጫወት ይችላሉ።`,
+    text,
     reply_markup: getMainKeyboard(),
   });
 }
@@ -365,9 +519,18 @@ async function saveTelegramContact(message: NonNullable<TelegramUpdate["message"
 async function handleTelegramUpdate(update: TelegramUpdate) {
   const callbackQuery = update.callback_query;
   if (callbackQuery) {
+    const adminChatId = getAdminChatId();
+    const callbackChatId = callbackQuery.message?.chat.id;
+    const decision = callbackQuery.data?.match(/^(deposit|withdrawal):(approve|reject):(\d+)$/);
+    if (decision && (!adminChatId || callbackChatId !== adminChatId)) {
+      await telegramRequest("answerCallbackQuery", { callback_query_id: callbackQuery.id, text: "Unauthorized.", show_alert: true });
+      return;
+    }
     await telegramRequest("answerCallbackQuery", { callback_query_id: callbackQuery.id });
     if (callbackQuery.data === "deposit:telebirr" && callbackQuery.message) {
       await sendTelebirrAmountPrompt(callbackQuery.message.chat.id);
+    } else if (decision && adminChatId) {
+      await processAdminDecision(decision[1] as "deposit" | "withdrawal", decision[2] as "approve" | "reject", Number(decision[3]), adminChatId);
     }
     return;
   }
@@ -380,6 +543,14 @@ async function handleTelegramUpdate(update: TelegramUpdate) {
 
   const text = message?.text?.trim();
   if (!message || !text) return;
+  if (text === "/pending") {
+    if (getAdminChatId() !== message.chat.id) {
+      await telegramRequest("sendMessage", { chat_id: message.chat.id, text: "Unauthorized." });
+      return;
+    }
+    await sendPendingRequests(message.chat.id);
+    return;
+  }
   if (text.startsWith("/start")) {
     await sendWelcomeMessage(message.chat.id, message.from?.first_name);
     return;
@@ -484,7 +655,12 @@ async function handleTelegramUpdate(update: TelegramUpdate) {
     return;
   }
 
-  if (text === "🎁 Promo Code" || text === "👤 Profile & Account") {
+  if (text === "👤 Profile & Account") {
+    await sendProfileAccountMessage(message.chat.id, message.from?.id);
+    return;
+  }
+
+  if (text === "🎁 Promo Code") {
     await telegramRequest("sendMessage", {
       chat_id: message.chat.id,
       text: "ይህ አማራጭ በቅርቡ ይገኛል።",
@@ -508,7 +684,7 @@ router.post("/telegram/webhook", async (req, res) => {
   }
 });
 
-router.post("/telegram/auth", (req, res) => {
+router.post("/telegram/auth", async (req, res) => {
   const botToken = getBotToken();
   const { initData } = req.body as TelegramAuthPayload;
   if (!botToken || typeof initData !== "string" || !isValidTelegramInitData(initData, botToken)) {
@@ -521,7 +697,16 @@ router.post("/telegram/auth", (req, res) => {
     res.status(401).json({ error: "Telegram user data is missing" });
     return;
   }
-  res.json({ user });
+  const profile = await db.query.telegramUsers.findFirst({
+    where: eq(telegramUsers.telegramId, user.id),
+    columns: {
+      firstName: true,
+      lastName: true,
+      playWalletBalance: true,
+      winWalletBalance: true,
+    },
+  });
+  res.json({ user, profile });
 });
 
 export async function registerTelegramWebhook() {

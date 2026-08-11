@@ -51,6 +51,12 @@ const CALL_INTERVAL = 3000;
 
 type Cell = number | 'star';
 type Tab = 'bingo' | 'wallet';
+type Profile = {
+  firstName?: string;
+  lastName?: string | null;
+  playWalletBalance?: string;
+  winWalletBalance?: string;
+};
 
 function buildCard(id: number): Cell[] {
   let seed = id * 9301 + 49297;
@@ -75,23 +81,9 @@ function buildCard(id: number): Cell[] {
   });
 }
 
-function makeSequence() {
-  const sequence = Array.from({ length: 75 }, (_, index) => index + 1);
-  let seed = 12345;
-  const random = () => {
-    seed = (seed * 9301 + 49297) % 233280;
-    return seed / 233280;
-  };
-  for (let index = sequence.length - 1; index > 0; index -= 1) {
-    const swap = Math.floor(random() * (index + 1));
-    [sequence[index], sequence[swap]] = [sequence[swap], sequence[index]];
-  }
-  const openingCalls = [61, 17, 11, 53];
-  return [...openingCalls, ...sequence.filter((number) => !openingCalls.includes(number))];
-}
-
 function useTelegramBridge() {
-  const [userName, setUserName] = useState('Demo player');
+  const [userName, setUserName] = useState('');
+  const [profile, setProfile] = useState<Profile | null>(null);
   const [isTelegram, setIsTelegram] = useState(false);
   useEffect(() => {
     const webApp = window.Telegram?.WebApp;
@@ -119,11 +111,15 @@ function useTelegramBridge() {
       body: JSON.stringify({ initData: webApp.initData }),
     }).then(async (response) => {
       if (!response.ok) return;
-      const data = await response.json() as { user?: { first_name?: string; last_name?: string } };
+      const data = await response.json() as { user?: { first_name?: string; last_name?: string }; profile?: Profile };
       if (data.user?.first_name) setUserName([data.user.first_name, data.user.last_name].filter(Boolean).join(' '));
+      if (data.profile) {
+        setProfile(data.profile);
+        if (data.profile.firstName) setUserName([data.profile.firstName, data.profile.lastName].filter(Boolean).join(' '));
+      }
     }).catch(() => undefined);
   }, []);
-  return { userName, isTelegram };
+  return { userName, profile, isTelegram };
 }
 
 function Header() {
@@ -154,7 +150,7 @@ function Header() {
           <button type="button" data-testid="button-header-help" onClick={() => setMenuOpen(false)} className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left text-sm hover:bg-white/10">
             <CircleHelp className="h-4 w-4 text-[hsl(var(--primary))]" /> እገዛ እና ህጎች
           </button>
-          <div className="px-3 pb-2 pt-1 text-[10px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]">{isTelegram ? userName : 'Browser demo'}</div>
+          <div className="px-3 pb-2 pt-1 text-[10px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]">{isTelegram ? userName : 'Telegram only'}</div>
         </div>
       )}
     </header>
@@ -263,6 +259,10 @@ function NumberGrid({ selected, taken, onToggle }: { selected: Set<number>; take
 }
 
 function WalletPanel() {
+  const { profile } = useTelegramBridge();
+  const playWallet = profile?.playWalletBalance ?? '—';
+  const winWallet = profile?.winWalletBalance ?? '—';
+
   return (
     <div className="flex-1 overflow-y-auto px-3 pb-5 pt-5">
       <section className="depth-surface relative rounded-[32px] bg-[hsl(161_35%_15%)] p-6 shadow-[0_12px_35px_hsl(161_42%_4%/.24)]">
@@ -270,11 +270,11 @@ function WalletPanel() {
         <div className="mt-5 grid grid-cols-2 gap-5">
           <div className="depth-card rounded-[26px] border border-[hsl(var(--foreground)/.8)] px-4 py-4">
             <div className="text-lg font-extrabold leading-tight">🎮 PLAY<br />WALLET</div>
-            <div data-testid="text-play-wallet-balance" className="mt-3 font-mono text-2xl font-bold">44.00</div>
+            <div data-testid="text-play-wallet-balance" className="mt-3 font-mono text-2xl font-bold">{playWallet}</div>
           </div>
           <div className="depth-card rounded-[26px] border border-[hsl(var(--foreground)/.8)] px-4 py-4">
             <div className="text-lg font-extrabold leading-tight">🏆 WIN<br />WALLET</div>
-            <div data-testid="text-win-wallet-balance" className="mt-3 font-mono text-2xl font-bold">0.00</div>
+            <div data-testid="text-win-wallet-balance" className="mt-3 font-mono text-2xl font-bold">{winWallet}</div>
           </div>
         </div>
       </section>
@@ -289,6 +289,25 @@ function WalletPanel() {
   );
 }
 
+function getApiUrl() {
+  const configured = import.meta.env.VITE_API_BASE_URL;
+  return configured ? (configured.startsWith('http') ? configured : `https://${configured}`) : '';
+}
+
+function telegramHeaders(): Record<string, string> {
+  const initData = window.Telegram?.WebApp?.initData;
+  return initData ? { 'x-telegram-init-data': initData } : {};
+}
+
+type RoundData = {
+  id: number;
+  calls: Array<{ number: number; position: number; calledAt: string }>;
+  takenCardNumbers: number[];
+  pot: string;
+  winner?: { name?: string; cardNumber: number; payout: string; status: string };
+};
+type ServerCard = { id?: number; cardNumber: number; grid: Cell[] };
+
 function Home() {
   const [, setLocation] = useLocation();
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -296,14 +315,28 @@ function Home() {
   const [countdown, setCountdown] = useState(START_COUNTDOWN);
   const [tab, setTab] = useState<Tab>('bingo');
   const [showWarning, setShowWarning] = useState(false);
-  const taken = useMemo(() => new Set([66, 68, 70, 73, 80, 83, 85, 87, 89, 91, 93, 95, 98, 101, 104, 107, 110, 112, 115, 119, 121, 124, 126, 131, 133, 137, 139]), []);
+  const [warningMessage, setWarningMessage] = useState('');
+  const [round, setRound] = useState<RoundData | null>(null);
+  const taken = useMemo(() => new Set(round?.takenCardNumbers ?? []), [round]);
+  useEffect(() => { void fetch(`${getApiUrl()}/api/bingo/round`).then((response) => response.ok ? response.json() as Promise<RoundData> : null).then((data) => { if (data) setRound(data); }).catch(() => undefined); }, []);
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   useEffect(() => {
     const timer = window.setInterval(() => setCountdown((current) => {
       if (current <= 1) {
         if (selectedRef.current.size > 0) {
-          setLocation(`/play?cards=${[...selectedRef.current].sort((a, b) => a - b).join(',')}`);
+          const cardNumbers = [...selectedRef.current].sort((a, b) => a - b);
+          void fetch(`${getApiUrl()}/api/bingo/cards`, { method: 'POST', headers: { 'content-type': 'application/json', ...telegramHeaders() }, body: JSON.stringify({ cardNumbers }) })
+            .then(async (response) => {
+              if (response.ok) return response.json() as Promise<{ roundId: number }>;
+              const body = await response.json().catch(() => ({})) as { error?: string };
+              setWarningMessage(response.status === 402 ? 'Insufficient play wallet balance' : response.status === 409 ? (body.error ?? 'A selected card was just taken') : (body.error ?? 'Card purchase failed'));
+              setShowWarning(true);
+              window.setTimeout(() => setShowWarning(false), 3000);
+              return null;
+            })
+            .then((data) => { if (data) setLocation(`/play?round=${data.roundId}`); })
+            .catch(() => { setWarningMessage('Card purchase failed. Please try again.'); setShowWarning(true); window.setTimeout(() => setShowWarning(false), 3000); });
           return 0;
         }
         return START_COUNTDOWN;
@@ -328,11 +361,11 @@ function Home() {
   return (
     <AppShell tab={tab} setTab={setTab}>
       {tab === 'wallet' ? <WalletPanel /> : <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <Stats play={selected.size * STAKE} pot={(taken.size + selected.size) * 40} cardsTaken={taken.size + selected.size} />
+        <Stats play={selected.size * STAKE} pot={Number(round?.pot ?? '0')} cardsTaken={taken.size} />
         <SoundCountdown muted={muted} onToggle={() => setMuted((value) => !value)} countdown={countdown} />
         <div className="min-h-0 flex-1 overflow-y-auto"><NumberGrid selected={selected} taken={taken} onToggle={toggle} /></div>
         {selectedCards.length > 0 && <div className="pointer-events-none absolute bottom-[74px] left-0 right-0 z-10 flex gap-2 overflow-hidden bg-gradient-to-t from-[hsl(161_42%_9%)] to-transparent px-3 pb-2 pt-8">{selectedCards.map((id) => <MiniCard key={id} id={id} grid={buildCard(id)} />)}</div>}
-        {showWarning && <div role="alert" data-testid="status-card-limit" className="absolute left-4 right-4 top-24 z-30 rounded-2xl border border-[hsl(var(--primary)/.6)] bg-[hsl(161_35%_15%/.98)] px-4 py-3 text-center text-sm font-bold text-[hsl(var(--primary))] shadow-xl animate-rise-in">ከ4 ካርድ በላይ መምረጥ አይችሉም</div>}
+        {showWarning && <div role="alert" data-testid="status-card-limit" className="absolute left-4 right-4 top-24 z-30 rounded-2xl border border-[hsl(var(--primary)/.6)] bg-[hsl(161_35%_15%/.98)] px-4 py-3 text-center text-sm font-bold text-[hsl(var(--primary))] shadow-xl animate-rise-in">{warningMessage || 'ከ4 ካርድ በላይ መምረጥ አይችሉም'}</div>}
       </div>}
     </AppShell>
   );
@@ -379,7 +412,7 @@ function PlayCard({ id, grid, called, winner, winnerEffect = 0, finalNumber }: {
   return <section className={`depth-card rounded-2xl border bg-[hsl(161_35%_15%)] p-2.5 transition-transform hover:-translate-y-0.5 ${winner ? 'winner-card border-[hsl(var(--primary))]' : 'border-[hsl(var(--primary)/.35)]'}`}><div className="mb-2 flex items-center justify-between"><span className="font-mono text-xs font-bold text-[hsl(var(--primary))]">CARD #{id}</span><span className="text-[10px] font-bold text-[hsl(var(--muted-foreground))]">{marked}/25</span></div><div className="mb-1 grid grid-cols-5 gap-1 text-center text-[9px] font-extrabold text-[hsl(var(--primary))]"><span>B</span><span>I</span><span>N</span><span>G</span><span>O</span></div><div className="grid grid-cols-5 gap-1">{grid.map((cell, index) => { const hit = cell === 'star' || (typeof cell === 'number' && called.has(cell)); const onLine = winner?.line.includes(index); const isCorner = winner?.corners.includes(index); const isFinalNumber = typeof cell === 'number' && cell === finalNumber; const effectClass = onLine ? `winner-line-cell winner-effect-${winnerEffect}` : isCorner ? 'winner-corner-cell' : hit ? 'called-number' : ''; const finalEffectClass = isFinalNumber ? `winner-final-number winner-effect-${winnerEffect}` : ''; return <div key={`${id}-${index}`} data-testid={`cell-card-${id}-${index}`} className={`grid aspect-square place-items-center rounded-md text-[11px] font-bold transition-all duration-300 ${effectClass} ${finalEffectClass} ${onLine ? 'bg-[hsl(var(--destructive))] text-[hsl(var(--foreground))]' : isCorner ? 'bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))]' : hit ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] shadow-[0_2px_0_hsl(152_61%_30%)]' : 'bg-[hsl(159_22%_22%)] text-[hsl(var(--foreground)/.8)]'}`}>{cell === 'star' ? '✦' : cell}</div>; })}</div></section>;
 }
 
-function WinnerModal({ card, called, pattern, winnerEffect, prize }: { card: { id: number; grid: Cell[] }; called: Set<number>; pattern: WinnerPattern; winnerEffect: number; prize: number }) {
+function WinnerModal({ card, called, pattern, winnerEffect, prize, winnerName }: { card: { id: number; grid: Cell[] }; called: Set<number>; pattern: WinnerPattern; winnerEffect: number; prize: string; winnerName: string }) {
   return (
     <div className='winner-overlay fixed inset-0 z-50 flex items-center justify-center overflow-y-auto px-4 py-8' role='dialog' aria-modal='true' aria-label='Bingo winner'>
       <div className='winner-confetti' aria-hidden='true'>
@@ -389,8 +422,8 @@ function WinnerModal({ card, called, pattern, winnerEffect, prize }: { card: { i
         <div className='winner-trophy' aria-hidden='true'>🏆</div>
         <p className='winner-title'>BINGO WINNER!</p>
         <p className='winner-prize-label'>TOTAL PRIZE</p>
-        <p className='winner-prize'>{prize.toLocaleString("en-US", { minimumFractionDigits: 2 })} <span>ብር</span></p>
-        <div className='winner-summary'>Name: <strong>ዜድ</strong> <span>|</span> Card: <strong>#{card.id}</strong></div>
+        <p className='winner-prize'>{Number(prize).toLocaleString("en-US", { minimumFractionDigits: 2 })} <span>ብር</span></p>
+        <div className='winner-summary'>Name: <strong>{winnerName || '—'}</strong> <span>|</span> Card: <strong>#{card.id}</strong></div>
         <div className='winner-card-frame'>
           <PlayCard id={card.id} grid={card.grid} called={called} winner={pattern} winnerEffect={winnerEffect} finalNumber={Array.from(called).at(-1)} />
         </div>
@@ -403,34 +436,37 @@ function Play() {
   const [location, setLocation] = useLocation();
   const [muted, setMuted] = useState(true);
   const [tab, setTab] = useState<Tab>('bingo');
-  const sequence = useMemo(makeSequence, []);
-  const [drawn, setDrawn] = useState(1);
-  const roundId = new URLSearchParams(location.split('?')[1] ?? '').get('round') ?? GAME_ID;
-  const winnerEffect = [...roundId].reduce((total, character) => total + character.charCodeAt(0), 0) % 4;
-  const cards = useMemo(() => {
-    const query = new URLSearchParams(location.split('?')[1] ?? '');
-    const ids = (query.get('cards') ?? '258,233,216,229').split(',').map(Number).filter(Number.isFinite).slice(0, 4);
-    return ids.map((id) => ({ id, grid: buildCard(id) }));
-  }, [location]);
-  const called = useMemo(() => new Set(sequence.slice(0, drawn)), [drawn, sequence]);
-  const current = sequence[Math.max(0, drawn - 1)] ?? null;
+  const [round, setRound] = useState<RoundData | null>(null);
+  const [cards, setCards] = useState<Array<{ id: number; grid: Cell[] }>>([]);
+  const query = new URLSearchParams(location.split('?')[1] ?? '');
+  const roundId = query.get('round');
+  const called = useMemo(() => new Set((round?.calls ?? []).map((call) => call.number)), [round]);
+  const current = round?.calls.at(-1)?.number ?? null;
+  const winnerEffect = String(round?.id ?? roundId ?? '').split('').reduce((total, character) => total + character.charCodeAt(0), 0) % 4;
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const roundResponse = await fetch(`${getApiUrl()}/api/bingo/round`);
+      if (!roundResponse.ok) return;
+      const nextRound = await roundResponse.json() as RoundData;
+      const cardResponse = await fetch(`${getApiUrl()}/api/bingo/cards`, { headers: telegramHeaders() });
+      const cardData = cardResponse.ok ? await cardResponse.json() as { cards: ServerCard[] } : { cards: [] };
+      if (!cancelled) { setRound(nextRound); setCards(cardData.cards.map((card) => ({ id: card.cardNumber, grid: card.grid }))); }
+    };
+    void load().catch(() => undefined);
+    const timer = window.setInterval(() => { void load().catch(() => undefined); }, CALL_INTERVAL);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [roundId]);
+  const serverWinner = round?.winner;
   const winnerMatch = useMemo(() => {
-    const match = cards
-      .map((card) => ({ card, pattern: findWinnerPattern(card.grid, called) }))
-      .find(({ pattern }) => pattern);
-    return match ?? null;
-  }, [called, cards]);
-  useEffect(() => {
-    if (winnerMatch || drawn >= sequence.length) return;
-    const timer = window.setTimeout(() => setDrawn((value) => Math.min(sequence.length, value + 1)), CALL_INTERVAL);
-    return () => window.clearTimeout(timer);
-  }, [drawn, sequence.length, winnerMatch]);
-  useEffect(() => {
-    if (!winnerMatch) return;
-    const timer = window.setTimeout(() => setLocation('/'), 6000);
-    return () => window.clearTimeout(timer);
-  }, [setLocation, winnerMatch]);
-  return <AppShell tab={tab} setTab={setTab}>{tab === 'wallet' ? <WalletPanel /> : <div className="min-h-0 flex-1 overflow-y-auto bg-[linear-gradient(180deg,hsl(161_42%_9%),hsl(161_48%_7%))] p-3"><div className="space-y-3"><CalledBoard called={called} latest={current} /><CalledPanel current={current} muted={muted} onToggle={() => setMuted((value) => !value)} callIndex={drawn} called={called} /><div className="grid grid-cols-2 gap-2.5">{cards.map((card) => { const pattern = winnerMatch?.card.id === card.id ? winnerMatch.pattern : null; return <PlayCard key={card.id} {...card} called={called} winner={pattern} />; })}</div><div className="flex items-center justify-center gap-2 pb-2 text-[11px] text-[hsl(var(--muted-foreground))]"><Sparkles className="h-3.5 w-3.5 text-[hsl(var(--primary))]" /> ቁጥሮች በየ 3 ሰከንዱ ይጠራሉ</div></div></div>}{winnerMatch && <WinnerModal card={winnerMatch.card} called={called} pattern={winnerMatch.pattern!} winnerEffect={winnerEffect} prize={2280} />}</AppShell>;
+    if (!serverWinner) return null;
+    const card = cards.find((item) => item.id === serverWinner.cardNumber);
+    if (!card) return null;
+    const pattern = findWinnerPattern(card.grid, called);
+    return pattern ? { card, pattern } : null;
+  }, [called, cards, serverWinner]);
+  useEffect(() => { if (!winnerMatch) return; const timer = window.setTimeout(() => setLocation('/'), 6000); return () => window.clearTimeout(timer); }, [setLocation, winnerMatch?.card.id, serverWinner?.payout]);
+  return <AppShell tab={tab} setTab={setTab}>{tab === 'wallet' ? <WalletPanel /> : <div className="min-h-0 flex-1 overflow-y-auto bg-[linear-gradient(180deg,hsl(161_42%_9%),hsl(161_48%_7%))] p-3"><div className="space-y-3"><CalledBoard called={called} latest={current} /><CalledPanel current={current} muted={muted} onToggle={() => setMuted((value) => !value)} callIndex={round?.calls.length ?? 0} called={called} /><div className="grid grid-cols-2 gap-2.5">{cards.map((card) => { const pattern = winnerMatch?.card.id === card.id ? winnerMatch.pattern : null; return <PlayCard key={card.id} {...card} called={called} winner={pattern} />; })}</div><div className="flex items-center justify-center gap-2 pb-2 text-[11px] text-[hsl(var(--muted-foreground))]"><Sparkles className="h-3.5 w-3.5 text-[hsl(var(--primary))]" /> ቁጥሮች በየ 3 ሰከንዱ ይጠራሉ</div></div></div>}{winnerMatch && serverWinner && <WinnerModal card={winnerMatch.card} called={called} pattern={winnerMatch.pattern!} winnerEffect={winnerEffect} prize={serverWinner.payout} winnerName={serverWinner.name ?? ''} />}</AppShell>;
 }
 
 function AppShell({ children, tab, setTab }: { children: ReactNode; tab: Tab; setTab: (tab: Tab) => void }) {

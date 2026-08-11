@@ -1,6 +1,7 @@
 import app from "./app";
 import { logger } from "./lib/logger";
 import { registerTelegramWebhook } from "./routes/telegram";
+import { startBingoRoundInterval } from "./routes/bingo";
 
 const rawPort = process.env["PORT"];
 
@@ -23,6 +24,7 @@ app.listen(port, (err) => {
   }
 
   logger.info({ port }, "Server listening");
+  startBingoRoundInterval();
   void registerTelegramWebhook().catch((error: unknown) => {
     logger.error({ err: error }, "Telegram webhook registration failed");
   });
